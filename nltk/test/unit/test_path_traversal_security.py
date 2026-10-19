@@ -314,6 +314,25 @@ class TestPathsecSymlinkHardening:
         with pytest.raises(PermissionError):
             P.open(hard, "r", required_root=root).read()
 
+    def test_write_to_hardlink_does_not_truncate_outside_inode(self, monkeypatch):
+        # A model write (TransitionParser.train / save_maxent_params) goes through
+        # pathsec.open(..., "w"). Truncating at open time would zero the outside
+        # inode behind an in-root hardlink before st_nlink refuses it (CWE-59).
+        P, base, root, outside = self._roots(monkeypatch)
+        secret = os.path.join(outside, "secret")
+        with open(secret, "w") as fh:
+            fh.write("TOP-SECRET")
+        hard = os.path.join(root, "hard.model")
+        try:
+            os.link(secret, hard)  # in-root name, outside-root inode
+        except OSError:
+            pytest.skip("cross-dir hardlink not permitted here")
+        for mode in ("w", "wb", "w+"):
+            with pytest.raises(PermissionError):
+                P.open(hard, mode, required_root=root)
+        with open(secret) as fh:
+            assert fh.read() == "TOP-SECRET", "outside inode was truncated"
+
     def test_malformed_mode_does_not_leak_fd(self, monkeypatch):
         # os.open() accepts some mode strings os.fdopen() rejects (e.g. ""). The
         # fdopen must be inside the fd-closing guard or repeated calls exhaust
@@ -347,7 +366,11 @@ class TestPerceptronSaveSquat:
         return t
 
     def test_benign_save_is_private_and_roundtrips(self):
-        base = tempfile.mkdtemp()
+        # The destination must now be inside an allowed data root: save_to_json
+        # no longer widens the sandbox to a caller's directory (GHSA-8mgp).
+        from nltk.data import make_staging_dir
+
+        base = make_staging_dir(prefix="nltk_test_save_")
         loc = os.path.join(base, "model_dir")
         t = self._tagger()
         t.save_to_json(lang="eng", loc=loc)
